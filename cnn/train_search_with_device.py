@@ -3,10 +3,13 @@ import sys
 import time
 import glob
 import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+import json
 import torch
 import utils
 import logging
 import argparse
+import math
 import torch.nn as nn
 import torch.utils
 import torch.nn.functional as F
@@ -41,6 +44,7 @@ parser.add_argument('--train_portion', type=float, default=0.5, help='portion of
 parser.add_argument('--unrolled', action='store_true', default=False, help='use one-step unrolled validation loss')
 parser.add_argument('--arch_learning_rate', type=float, default=3e-4, help='learning rate for arch encoding')
 parser.add_argument('--arch_weight_decay', type=float, default=1e-3, help='weight decay for arch encoding')
+parser.add_argument('--device_latency', action='store_true', default=False, help='get loss with device latency regarded')
 args = parser.parse_args()
 
 args.save = 'search-{}-{}'.format(args.save, time.strftime("%Y%m%d-%H%M%S"))
@@ -53,9 +57,48 @@ fh = logging.FileHandler(os.path.join(args.save, 'log.txt'))
 fh.setFormatter(logging.Formatter(log_format))
 logging.getLogger().addHandler(fh)
 
+with open('./performance.json') as f:
+    LUT = json.load(f)
 
+C_dict = {
+    0:16,
+    1:16,
+    2:32,
+    3:32,
+    4:32,
+    5:64,
+    6:64,
+    7:64
+}
+Alpha = 0.2
+Beta = 0.6
+def get_latency_coeff(z,a=Alpha,b=Beta):
+    return (a*math.log(z))**b
+
+_w = []
+for _z in  [x for x in range(100000, 350000, 25000)]:
+    _w.append(get_latency_coeff(_z,Alpha,Beta))
+    
+__w = np.array([[w_] for w_ in _w])
+SCALER = MinMaxScaler(feature_range=(0.5,3.0))
+SCALER.fit(__w)
+
+def get_total_latency(genotype,lut=LUT,c_dict=C_dict):
+    estimated_total_ave_second = 0
+    genotype_normal = [g[0] for g in genotype.normal]
+    genotype_reduce = [g[0] for g in genotype.reduce]
+    for k,v in C_dict.items():
+        for n,r in zip(genotype_normal, genotype_reduce):
+            if k == 2 or k == 5:
+                estimated_total_ave_second += LUT[r][str(v)]["average_second"]
+            else:
+                estimated_total_ave_second += LUT[n][str(v)]["average_second"]
+    return estimated_total_ave_second
+    
 CIFAR_CLASSES = 10
 
+estimated_total_ave_micro_second_list = []
+latency_coef_list = []
 
 def main():
   if not torch.cuda.is_available():
@@ -91,14 +134,18 @@ def main():
   split = int(np.floor(args.train_portion * num_train))
 
   train_queue = torch.utils.data.DataLoader(
-      train_data, batch_size=args.batch_size,
+      train_data, 
+      batch_size=args.batch_size,
       sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[:split]),
-      pin_memory=False, num_workers=2)
+      pin_memory=False, 
+      num_workers=4)
 
   valid_queue = torch.utils.data.DataLoader(
-      train_data, batch_size=args.batch_size,
+      train_data, 
+      batch_size=args.batch_size,
       sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[split:num_train]),
-      pin_memory=False, num_workers=2)
+      pin_memory=False, 
+      num_workers=4)
 
   scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, float(args.epochs), eta_min=args.learning_rate_min)
@@ -112,22 +159,35 @@ def main():
 
     genotype = model.genotype()
     logging.info('genotype = %s', genotype)
+    
+    logging.info("Device latency: {0}".format(args.device_latency))
+    if args.device_latency:
+        logging.info("Multiply loss with device latency coefficient.")
+    estimated_total_ave_second = get_total_latency(genotype=genotype)
+    estimated_total_ave_micro_second = estimated_total_ave_second * 1000000
+    estimated_total_ave_micro_second_list.append(estimated_total_ave_micro_second)
+    latency_coef = float(SCALER.transform(np.array([[get_latency_coeff(estimated_total_ave_micro_second)]]))[0][0])
+    latency_coef_list.append(latency_coef)
+    
+    logging.info('Estimated total average micro seconds per prediction: {0}\tcoeff: {1}'.format(estimated_total_ave_micro_second, latency_coef))
+    for i,s in enumerate(estimated_total_ave_micro_second_list):
+        logging.info("Record_{0}: {1}\t{2}".format(i,s,latency_coef_list[i]))
 
-    print(F.softmax(model.alphas_normal, dim=-1))
-    print(F.softmax(model.alphas_reduce, dim=-1))
+    logging.info(F.softmax(model.alphas_normal, dim=-1))
+    logging.info(F.softmax(model.alphas_reduce, dim=-1))
 
     # training
-    train_acc, train_obj = train(train_queue, valid_queue, model, architect, criterion, optimizer, lr)
-    logging.info('train_acc %f', train_acc)
+    train_acc, train_obj = train(train_queue, valid_queue, model, architect, criterion, optimizer, lr, latency_coef)
+    logging.info('TRAIN accuracy: %f', train_acc)
 
     # validation
-    valid_acc, valid_obj = infer(valid_queue, model, criterion)
-    logging.info('valid_acc %f', valid_acc)
+    valid_acc, valid_obj = infer(valid_queue, model, criterion, latency_coef)
+    logging.info('VALID accuracy: %f', valid_acc)
 
     utils.save(model, os.path.join(args.save, 'weights.pt'))
 
 
-def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr):
+def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr, latency_coef):
   objs = utils.AvgrageMeter()
   top1 = utils.AvgrageMeter()
   top5 = utils.AvgrageMeter()
@@ -149,53 +209,48 @@ def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr):
     optimizer.zero_grad()
     logits = model(input)
     loss = criterion(logits, target)
+    if args.device_latency:
+        loss = loss * latency_coef
 
     loss.backward()
     nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
     optimizer.step()
 
     prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
-#     objs.update(loss.data[0], n)
     objs.update(loss.item(), n)
-#     top1.update(prec1.data[0], n)
     top1.update(prec1.item(), n)
-#     top5.update(prec5.data[0], n)
     top5.update(prec5.item(), n)
-#     logging.info(loss.item(), prec1.item(), prec5.item(), n)
 
     if step % args.report_freq == 0:
-      logging.info('train %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
+      logging.info('TRAIN: steps: %03d loss.avg: %e top1.avg: %f top5.avg: %f', step, objs.avg, top1.avg, top5.avg)
 
   return top1.avg, objs.avg
 
 
-def infer(valid_queue, model, criterion):
+def infer(valid_queue, model, criterion, latency_coef):
   objs = utils.AvgrageMeter()
   top1 = utils.AvgrageMeter()
   top5 = utils.AvgrageMeter()
   model.eval()
 
   for step, (input, target) in enumerate(valid_queue):
-#     input = Variable(input, volatile=True).cuda()
-#     target = Variable(target, volatile=True).cuda(async=True)
     with torch.no_grad():
         input = Variable(input).cuda()
         target = Variable(target).cuda(async=True)
 
         logits = model(input)
         loss = criterion(logits, target)
+        if args.device_latency:
+            loss = loss * latency_coef
 
         prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
         n = input.size(0)
-    #     objs.update(loss.data[0], n)
-    #     top1.update(prec1.data[0], n)
-    #     top5.update(prec5.data[0], n)
         objs.update(loss.item(), n)
         top1.update(prec1.item(), n)
         top5.update(prec5.item(), n)
 
         if step % args.report_freq == 0:
-          logging.info('valid %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
+          logging.info('VALID: steps: %03d loss.avg: %e top1.avg: %f top5.avg: %f', step, objs.avg, top1.avg, top5.avg)
 
         return top1.avg, objs.avg
 
