@@ -61,14 +61,14 @@ with open('./performance.json') as f:
     LUT = json.load(f)
 
 C_dict = {
-    0:16,
-    1:16,
-    2:32,
-    3:32,
-    4:32,
-    5:64,
-    6:64,
-    7:64
+    0:16, # normal
+    1:16, # normal
+    2:32, # reduction
+    3:32, # normal
+    4:32, # normal
+    5:64, # reduction
+    6:64, # normal
+    7:64 # normal
 }
 Alpha = 0.2
 Beta = 0.6
@@ -85,15 +85,31 @@ SCALER.fit(__w)
 
 def get_total_latency(genotype,lut=LUT,c_dict=C_dict):
     estimated_total_ave_second = 0
-    genotype_normal = [g[0] for g in genotype.normal]
-    genotype_reduce = [g[0] for g in genotype.reduce]
-    for k,v in C_dict.items():
-        for n,r in zip(genotype_normal, genotype_reduce):
-            if k == 2 or k == 5:
-                estimated_total_ave_second += LUT[r][str(v)]["average_second"]
-            else:
-                estimated_total_ave_second += LUT[n][str(v)]["average_second"]
-    return estimated_total_ave_second
+    if args.device_latency:
+        genotypes = [
+            [g[0] for g in genotype.normal_0],
+            [g[0] for g in genotype.normal_1],
+            [g[0] for g in genotype.reduce_2],
+            [g[0] for g in genotype.normal_3],
+            [g[0] for g in genotype.normal_4],
+            [g[0] for g in genotype.reduce_5],
+            [g[0] for g in genotype.normal_6],
+            [g[0] for g in genotype.normal_7],
+        ]
+        for k,v in C_dict.items():
+            for g in genotypes[k]:
+                estimated_total_ave_second += LUT[g][str(v)]["average_second"]
+        return estimated_total_ave_second
+    else:
+        genotype_normal = [g[0] for g in genotype.normal]
+        genotype_reduce = [g[0] for g in genotype.reduce]
+        for k,v in C_dict.items():
+            for n,r in zip(genotype_normal, genotype_reduce):
+                if k == 2 or k == 5:
+                    estimated_total_ave_second += LUT[r][str(v)]["average_second"]
+                else:
+                    estimated_total_ave_second += LUT[n][str(v)]["average_second"]
+        return estimated_total_ave_second
     
 CIFAR_CLASSES = 10
 
@@ -116,7 +132,7 @@ def main():
 
   criterion = nn.CrossEntropyLoss()
   criterion = criterion.cuda()
-  model = Network(args.init_channels, CIFAR_CLASSES, args.layers, criterion)
+  model = Network(args.init_channels, CIFAR_CLASSES, args.layers, criterion, d=args.device_latency)
   model = model.cuda()
   logging.info("param size = %fMB", utils.count_parameters_in_MB(model))
 
@@ -173,8 +189,9 @@ def main():
     for i,s in enumerate(estimated_total_ave_micro_second_list):
         logging.info("Record_{0}: {1}\t{2}".format(i,s,latency_coef_list[i]))
 
-    logging.info(F.softmax(model.alphas_normal, dim=-1))
-    logging.info(F.softmax(model.alphas_reduce, dim=-1))
+    archs = model.arch_parameters()
+    for v in archs:
+        logging.info(F.softmax(v, dim=-1))
 
     # training
     train_acc, train_obj = train(train_queue, valid_queue, model, architect, criterion, optimizer, lr, latency_coef)
